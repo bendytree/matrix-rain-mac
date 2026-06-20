@@ -84,7 +84,9 @@ class ScreenRecorder: ObservableObject {
         // Refresh the lists of capturable content.
         await refreshAvailableContent()
         Timer.publish(every: 3, on: .main, in: .common).autoconnect().sink { [weak self] _ in
-            guard let self = self else { return }
+            // Skip the (expensive) content enumeration while the overlay is running — it's only
+            // needed to keep the display/window pickers fresh, which aren't used mid-effect.
+            guard let self = self, !self.isRunning else { return }
             Task {
                 await self.refreshAvailableContent()
             }
@@ -197,12 +199,15 @@ class ScreenRecorder: ObservableObject {
             streamConfig.height = Int(window.frame.height) // * 2
         }
         
-        // Set the capture interval at 60 fps.
-        streamConfig.minimumFrameInterval = CMTime(value: 1, timescale: 60)
-        
-        // Increase the depth of the frame queue to ensure high fps at the expense of increasing
-        // the memory footprint of WindowServer.
-        streamConfig.queueDepth = 5
+        // Capture rate follows the same frame-rate control as the renderer (params.fps), read at
+        // capture start. Lower fps = far less WindowServer work copying the screen. The renderer
+        // reuses the latest frame between captures, so animation stays as smooth as the render rate.
+        // (Change the slider, then toggle Visor Up/Down to re-apply the capture rate.)
+        let fps = Int32(max(1, capturePreview.metalView.params.fps.rounded()))
+        streamConfig.minimumFrameInterval = CMTime(value: 1, timescale: fps)
+
+        // Shallow queue: we only ever consume the newest frame, so a deep queue just costs memory.
+        streamConfig.queueDepth = 3
         streamConfig.pixelFormat = kCVPixelFormatType_32BGRA
         
         return streamConfig

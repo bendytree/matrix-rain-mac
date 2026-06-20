@@ -32,6 +32,7 @@ struct MatrixUniforms {
     var cursorX: Float = 0
     var cursorY: Float = 0
     var cursorRadius: Float = 0       // rain-clear bubble radius in px (0 = off)
+    var glowOn: Float = 1             // 1 = CRT bloom on, 0 = skip the 9-tap bloom
 }
 
 /// Live-tunable parameters, bound to the settings sliders and read by the renderer each frame.
@@ -50,9 +51,55 @@ final class MatrixParams: ObservableObject {
     @Published var trailLength: Float = 50    // stream length in cells
     @Published var barSpeed: Float = 0.1      // rolling hum-bar speed (0 = off)
     @Published var cursorClear: Float = 0     // rain-clear bubble diameter in points (0 = off)
+    @Published var fps: Float = 24            // render + capture frame rate (rain doesn't need 60)
     @Published var rainOn: Bool = true
+    @Published var glowOn: Bool = true        // CRT bloom (the expensive 9-tap pass)
     @Published var maskDebug: Bool = false
 }
+
+// MARK: - Pass 0: busyness mask prepass  (input -> mask, one thread per mask-cell)
+
+let maskShaderSource = """
+#include <metal_stdlib>
+using namespace metal;
+
+struct Uniforms {
+    float time, resX, resY, flatThreshold, rainOpacity, rainSpeed,
+          glyphChurn, cellSize, scanlineStrength, glow, curvature, contrast,
+          atlasCols, atlasCount, maskDebug, rainOn, maskCell, rainDensity, trailLen,
+          rollOffset, rollAmt, barSpeed, cursorX, cursorY, cursorRadius, glowOn;
+};
+static inline float luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
+
+// One thread per mask-cell. Writes per-cell luma contrast (max-min) so the matrix pass reads a
+// single texel instead of re-running this 36-tap loop for every pixel in the cell.
+kernel void computeShader(texture2d<float, access::read>  input [[texture(0)]],
+                          texture2d<float, access::write> mask  [[texture(1)]],
+                          constant Uniforms&              u     [[buffer(0)]],
+                          uint2 gid [[thread_position_in_grid]])
+{
+    uint MW = mask.get_width();
+    uint MH = mask.get_height();
+    if (gid.x >= MW || gid.y >= MH) return;
+
+    uint W = input.get_width();
+    uint H = input.get_height();
+    float mcell = max(u.maskCell, 4.0);
+    float2 mOrigin = float2(gid) * mcell;
+    float mn = 1.0, mx = 0.0;
+    const int M = 6;
+    for (int sy = 0; sy < M; sy++) {
+        for (int sx = 0; sx < M; sx++) {
+            float2 sp = mOrigin + (float2(float(sx), float(sy)) + 0.5) / float(M) * mcell;
+            uint2 ip = uint2(clamp(sp, float2(0.0), float2(float(W) - 1.0, float(H) - 1.0)));
+            float Ls = luma(input.read(ip).rgb);
+            mn = min(mn, Ls);
+            mx = max(mx, Ls);
+        }
+    }
+    mask.write(float4(mx - mn, 0.0, 0.0, 0.0), gid);
+}
+"""
 
 // MARK: - Pass 1: matrixify + content-aware rain  (input -> mid)
 
@@ -64,7 +111,7 @@ struct Uniforms {
     float time, resX, resY, flatThreshold, rainOpacity, rainSpeed,
           glyphChurn, cellSize, scanlineStrength, glow, curvature, contrast,
           atlasCols, atlasCount, maskDebug, rainOn, maskCell, rainDensity, trailLen,
-          rollOffset, rollAmt, barSpeed, cursorX, cursorY, cursorRadius;
+          rollOffset, rollAmt, barSpeed, cursorX, cursorY, cursorRadius, glowOn;
 };
 
 static inline float hash11(float p) {
@@ -83,6 +130,7 @@ static inline float luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114));
 kernel void computeShader(texture2d<float, access::read>   input      [[texture(0)]],
                           texture2d<float, access::write>  output     [[texture(1)]],
                           texture2d<float, access::sample> glyphAtlas [[texture(2)]],
+                          texture2d<float, access::read>   mask       [[texture(3)]],
                           constant Uniforms&               u          [[buffer(0)]],
                           uint2 gid [[thread_position_in_grid]])
 {
@@ -93,25 +141,11 @@ kernel void computeShader(texture2d<float, access::read>   input      [[texture(
     float3 c = input.read(gid).rgb;
     float L = luma(c);
 
-    // --- "busyness" mask on a FINE, densely-sampled grid, independent of the rain glyph
-    //     size, so thin text strokes are reliably caught (not missed between samples).
-    //     Per mask-cell luma contrast (max-min). Brightness-independent: only detail
-    //     (text, icons, images) reads as busy; plain/low-gradient backgrounds read as flat. ---
+    // --- "busyness" mask: precomputed once per mask-cell in the prepass (see maskShader) and
+    //     read here as a single texel. Per mask-cell luma contrast (max-min), brightness-
+    //     independent: only detail (text, icons, images) reads as busy; plain backgrounds flat. ---
     float mcell = max(u.maskCell, 4.0);
-    float2 mId = floor(float2(gid) / mcell);
-    float2 mOrigin = mId * mcell;
-    float mn = 1.0, mx = 0.0;
-    const int M = 6;
-    for (int sy = 0; sy < M; sy++) {
-        for (int sx = 0; sx < M; sx++) {
-            float2 sp = mOrigin + (float2(float(sx), float(sy)) + 0.5) / float(M) * mcell;
-            uint2 ip = uint2(clamp(sp, float2(0.0), float2(float(W) - 1.0, float(H) - 1.0)));
-            float Ls = luma(input.read(ip).rgb);
-            mn = min(mn, Ls);
-            mx = max(mx, Ls);
-        }
-    }
-    float range = mx - mn;
+    float range = mask.read(uint2(floor(float2(gid) / mcell))).r;
     float busy = smoothstep(u.flatThreshold, u.flatThreshold * 2.5, range);
     float flat = 1.0 - busy;   // 1 = plain background => rain eligible
 
@@ -128,46 +162,46 @@ kernel void computeShader(texture2d<float, access::read>   input      [[texture(
         return;
     }
 
-    // --- Matrix digital rain: per-column falling streams. The leading glyph (bottom of a
-    //     stream) is brightest / near-white; the trail fades exponentially to black going up.
-    //     Streams vary in length & speed, with dark gaps between them; glyphs flicker. ---
-    constexpr sampler smp(filter::linear, address::clamp_to_edge);
-    float cell = max(u.cellSize, 4.0);
-    float2 cellId = floor(float2(gid) / cell);
-    float2 cellUV = fract(float2(gid) / cell);
-    float rows = max(u.resY / cell, 1.0);
-    float gap = rows * 0.6;          // dark gap between successive streams in a column
-
+    // --- Matrix digital rain: per-column falling streams (leading glyph brightest, trail fades
+    //     up). Skipped entirely when Rain is off, so the per-pixel loop + glyph sample cost nothing. ---
     float intensity = 0.0;           // brightness envelope at this cell (1 = head)
     float headMix = 0.0;             // 1 at the leading glyph (white), 0 up the trail
-    const int MAXDROPS = 12;
-    for (int d = 0; d < MAXDROPS; d++) {
-        float w = clamp(u.rainDensity - float(d), 0.0, 1.0);
-        if (w <= 0.0) break;
-        float ds = hash21(float2(cellId.x, float(d) * 37.0));
-        float trailLen = u.trailLen * (0.6 + 0.8 * hash11(cellId.x * 1.7 + float(d) * 5.3));
-        float total = rows + trailLen + gap;
-        float spd = u.rainSpeed * rows * (0.5 + ds);          // rows per second
-        float head = fmod(ds * total + u.time * spd, total) - trailLen;
-        float dd = head - cellId.y;                            // cells above the head = trail
-        if (dd >= 0.0 && dd < trailLen) {
-            float b = exp(-dd * (3.5 / trailLen)) * w;         // head brightest, fades up
-            if (b > intensity) {
-                intensity = b;
-                headMix = smoothstep(1.5, 0.0, dd);
+    float glyph = 0.0;
+    if (u.rainOn > 0.5) {
+        constexpr sampler smp(filter::linear, address::clamp_to_edge);
+        float cell = max(u.cellSize, 4.0);
+        float2 cellId = floor(float2(gid) / cell);
+        float2 cellUV = fract(float2(gid) / cell);
+        float rows = max(u.resY / cell, 1.0);
+        float gap = rows * 0.6;          // dark gap between successive streams in a column
+        const int MAXDROPS = 12;
+        for (int d = 0; d < MAXDROPS; d++) {
+            float w = clamp(u.rainDensity - float(d), 0.0, 1.0);
+            if (w <= 0.0) break;
+            float ds = hash21(float2(cellId.x, float(d) * 37.0));
+            float trailLen = u.trailLen * (0.6 + 0.8 * hash11(cellId.x * 1.7 + float(d) * 5.3));
+            float total = rows + trailLen + gap;
+            float spd = u.rainSpeed * rows * (0.5 + ds);          // rows per second
+            float head = fmod(ds * total + u.time * spd, total) - trailLen;
+            float dd = head - cellId.y;                            // cells above the head = trail
+            if (dd >= 0.0 && dd < trailLen) {
+                float b = exp(-dd * (3.5 / trailLen)) * w;         // head brightest, fades up
+                if (b > intensity) {
+                    intensity = b;
+                    headMix = smoothstep(1.5, 0.0, dd);
+                }
             }
         }
+        // Glyph per cell with per-cell desynchronised flicker (Glyph churn = rate; 0 = static).
+        float cellRand = hash21(cellId * 1.31 + 2.0);
+        float flick = floor(u.time * u.glyphChurn * (0.4 + cellRand) + cellRand * 13.0);
+        float gi = floor(hash21(cellId * 1.13 + flick * 1.7) * u.atlasCount);
+        float ac = max(u.atlasCols, 1.0);
+        float arows = ceil(u.atlasCount / ac);
+        float2 aCell = float2(fmod(gi, ac), floor(gi / ac));
+        float2 auv = (aCell + cellUV) / float2(ac, max(arows, 1.0));
+        glyph = glyphAtlas.sample(smp, auv).r;
     }
-
-    // Glyph per cell with per-cell desynchronised flicker (Glyph churn = flicker rate; 0 = static).
-    float cellRand = hash21(cellId * 1.31 + 2.0);
-    float flick = floor(u.time * u.glyphChurn * (0.4 + cellRand) + cellRand * 13.0);
-    float gi = floor(hash21(cellId * 1.13 + flick * 1.7) * u.atlasCount);
-    float ac = max(u.atlasCols, 1.0);
-    float arows = ceil(u.atlasCount / ac);
-    float2 aCell = float2(fmod(gi, ac), floor(gi / ac));
-    float2 auv = (aCell + cellUV) / float2(ac, max(arows, 1.0));
-    float glyph = glyphAtlas.sample(smp, auv).r;
 
     float lightAmt = smoothstep(0.40, 0.80, g);
     float coverage = glyph * intensity;
@@ -208,7 +242,7 @@ struct Uniforms {
     float time, resX, resY, flatThreshold, rainOpacity, rainSpeed,
           glyphChurn, cellSize, scanlineStrength, glow, curvature, contrast,
           atlasCols, atlasCount, maskDebug, rainOn, maskCell, rainDensity, trailLen,
-          rollOffset, rollAmt, barSpeed, cursorX, cursorY, cursorRadius;
+          rollOffset, rollAmt, barSpeed, cursorX, cursorY, cursorRadius, glowOn;
 };
 
 kernel void computeShader(texture2d<float, access::sample> input  [[texture(0)]],
@@ -242,14 +276,16 @@ kernel void computeShader(texture2d<float, access::sample> input  [[texture(0)]]
     constexpr sampler smp(filter::linear, address::clamp_to_edge);
     float3 col = input.sample(smp, duv).rgb;
 
-    // --- phosphor glow (cheap 3x3) ---
-    float2 px = 2.0 / res;
-    float3 bloom = float3(0.0);
-    for (int dx = -1; dx <= 1; dx++)
-        for (int dy = -1; dy <= 1; dy++)
-            bloom += input.sample(smp, duv + float2(dx, dy) * px).rgb;
-    bloom /= 9.0;
-    col += bloom * u.glow;
+    // --- phosphor glow (3x3) — skipped entirely when Glow is off (saves 9 texture taps/pixel) ---
+    if (u.glowOn > 0.5) {
+        float2 px = 2.0 / res;
+        float3 bloom = float3(0.0);
+        for (int dx = -1; dx <= 1; dx++)
+            for (int dy = -1; dy <= 1; dy++)
+                bloom += input.sample(smp, duv + float2(dx, dy) * px).rgb;
+        bloom /= 9.0;
+        col += bloom * u.glow;
+    }
 
     // --- scanlines (period ~4px) ---
     float scan = 1.0 - u.scanlineStrength * (0.5 + 0.5 * sin(float(gid.y) * 1.57));
@@ -303,11 +339,14 @@ struct CapturePreview: NSViewRepresentable {
 
 class MetalView: MTKView {
     private var commandQueue: MTLCommandQueue!
+    private var maskPipeline: MTLComputePipelineState!
     private var matrixPipeline: MTLComputePipelineState!
     private var crtPipeline: MTLComputePipelineState!
 
     private var texture: MTLTexture!        // latest captured frame
     private var midTexture: MTLTexture!     // pass-1 output / pass-2 input
+    private var maskTexture: MTLTexture!    // pass-0 output: per-cell busyness
+    private var maskCols = 0, maskRows = 0
     private var glyphAtlas: MTLTexture!
 
     let params = MatrixParams()
@@ -342,12 +381,14 @@ class MetalView: MTKView {
         framebufferOnly = false
         autoResizeDrawable = false
         // Self-driven clock so the rain animates even when the screen is static.
+        // Rate is driven live from params.fps in draw(); start at that default.
         isPaused = false
         enableSetNeedsDisplay = false
-        preferredFramesPerSecond = 60
+        preferredFramesPerSecond = max(1, Int(params.fps.rounded()))
 
         commandQueue = device.makeCommandQueue()
         glyphAtlas = MetalView.makeGlyphAtlas(device: device, uniforms: &uniforms)
+        maskPipeline = MetalView.makePipeline(device: device, source: maskShaderSource)
         matrixPipeline = MetalView.makePipeline(device: device, source: matrixShaderSource)
         crtPipeline = MetalView.makePipeline(device: device, source: crtShaderSource)
         NSWorkspace.shared.notificationCenter.addObserver(
@@ -406,10 +447,30 @@ class MetalView: MTKView {
         midTexture = device.makeTexture(descriptor: d)
     }
 
+    /// Allocates the small per-cell mask texture (one texel per mask-cell). Resizes when the
+    /// frame size or the live-tunable mask-cell size changes.
+    private func ensureMaskTexture(width: Int, height: Int, mcell: Float) {
+        let m = max(mcell, 4)
+        let cols = Int((Float(width) / m).rounded(.up))
+        let rows = Int((Float(height) / m).rounded(.up))
+        if maskTexture != nil, maskCols == cols, maskRows == rows { return }
+        guard let device = device, cols > 0, rows > 0 else { return }
+        let d = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .r16Float, width: cols, height: rows, mipmapped: false)
+        d.usage = [.shaderRead, .shaderWrite]
+        d.storageMode = .private
+        maskTexture = device.makeTexture(descriptor: d)
+        maskCols = cols; maskRows = rows
+    }
+
     override func draw(_ dirtyRect: CGRect) {
         super.draw(dirtyRect)
+        // Live render-rate control (the rain animates fine well below 60fps).
+        let targetFPS = max(1, Int(params.fps.rounded()))
+        if preferredFramesPerSecond != targetFPS { preferredFramesPerSecond = targetFPS }
         guard let texture = texture,
               let midTexture = midTexture,
+              let maskPipeline = maskPipeline,
               let matrixPipeline = matrixPipeline,
               let crtPipeline = crtPipeline,
               let drawable = currentDrawable,
@@ -431,6 +492,7 @@ class MetalView: MTKView {
         uniforms.trailLen = params.trailLength
         uniforms.barSpeed = params.barSpeed
         uniforms.rainOn = params.rainOn ? 1 : 0
+        uniforms.glowOn = params.glowOn ? 1 : 0
         uniforms.maskDebug = params.maskDebug ? 1 : 0
 
         // Warp only when the mouse is idle: flatten while moving (+1s debounce), bulge when still.
@@ -468,8 +530,23 @@ class MetalView: MTKView {
             uniforms.rollAmt = 0
         }
 
+        ensureMaskTexture(width: texture.width, height: texture.height, mcell: uniforms.maskCell)
+        guard let maskTexture = maskTexture else { return }
+
         let tg = MTLSizeMake(16, 16, 1)
         let groups = MTLSizeMake((texture.width + 15) / 16, (texture.height + 15) / 16, 1)
+
+        // Pass 0: input -> mask (one thread per mask-cell)
+        if let e0 = commandBuffer.makeComputeCommandEncoder() {
+            e0.setComputePipelineState(maskPipeline)
+            e0.setTexture(texture, index: 0)
+            e0.setTexture(maskTexture, index: 1)
+            e0.setBytes(&uniforms, length: MemoryLayout<MatrixUniforms>.stride, index: 0)
+            let mtg = MTLSizeMake(8, 8, 1)
+            let mgroups = MTLSizeMake((maskCols + 7) / 8, (maskRows + 7) / 8, 1)
+            e0.dispatchThreadgroups(mgroups, threadsPerThreadgroup: mtg)
+            e0.endEncoding()
+        }
 
         // Pass 1: input -> mid
         if let e1 = commandBuffer.makeComputeCommandEncoder() {
@@ -477,6 +554,7 @@ class MetalView: MTKView {
             e1.setTexture(texture, index: 0)
             e1.setTexture(midTexture, index: 1)
             e1.setTexture(glyphAtlas, index: 2)
+            e1.setTexture(maskTexture, index: 3)
             e1.setBytes(&uniforms, length: MemoryLayout<MatrixUniforms>.stride, index: 0)
             e1.dispatchThreadgroups(groups, threadsPerThreadgroup: tg)
             e1.endEncoding()
