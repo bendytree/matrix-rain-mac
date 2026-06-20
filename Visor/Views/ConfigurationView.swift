@@ -9,6 +9,7 @@ struct ConfigurationView: View {
     @ObservedObject var screenRecorder: ScreenRecorder
     @State var shaderPath: String = "../shaders/invert.metal"
     @State private var showingSettings = false
+    @State private var isRecording = false
 
     var body: some View {
         Button("Settings") { showSettings() }
@@ -16,6 +17,12 @@ struct ConfigurationView: View {
         Button("Select Shader") { selectShader() }
             .disabled(screenRecorder.isRunning)
         Button("Matrix Settings…") { showMatrixSettings() }
+        Button(isRecording ? "■ Stop Recording" : "● Record Effect to Video") {
+            let mv = screenRecorder.capturePreview.metalView
+            mv.toggleRecording()
+            isRecording = mv.isRecording
+        }
+        .disabled(!screenRecorder.isRunning)
         Button("Visor Down") {
             Task {
                 await screenRecorder.monitorAvailableContent()

@@ -190,7 +190,7 @@ class ScreenRecorder: ObservableObject {
 
             streamConfig.sourceRect = CGRect(x: 0, y: topSpace, width: display.width,
                                              height: display.height - topSpace)
-            streamConfig.showsCursor = false
+            streamConfig.showsCursor = true   // include the cursor so it appears (recolored) in recordings
         }
         
         // Configure the window content width and height.

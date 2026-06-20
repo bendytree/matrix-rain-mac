@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import CoreText
 import MetalKit
 import QuartzCore
@@ -357,6 +358,18 @@ class MetalView: MTKView {
     private var warpFactor: Float = 1   // 1 = warped, 0 = flat (cursor near a corner)
     private var rollStartTime: CFTimeInterval = -10   // CRT sync-roll trigger time
 
+    // In-app recorder: writes the rendered overlay output straight to a video file. This records
+    // exactly what the effect produces (pixel-perfect, high bitrate) with no screen capture and no
+    // sharingType change — so the self-capture "wormhole" is impossible.
+    private(set) var isRecording = false
+    private var assetWriter: AVAssetWriter?
+    private var videoInput: AVAssetWriterInput?
+    private var pbAdaptor: AVAssetWriterInputPixelBufferAdaptor?
+    private var recCache: CVMetalTextureCache?
+    private var recFrameIndex: Int64 = 0
+    private var recURL: URL?
+    private var recIndicator: NSPanel?
+
     required init(coder: NSCoder) {
         super.init(coder: coder)
         guard let device = MTLCreateSystemDefaultDevice() else {
@@ -399,6 +412,74 @@ class MetalView: MTKView {
     deinit { NSWorkspace.shared.notificationCenter.removeObserver(self) }
 
     @objc private func spaceChangedRoll() { rollStartTime = CACurrentMediaTime() }
+
+    // MARK: - Recording (overlay output -> high-quality video file)
+
+    func toggleRecording() { isRecording ? stopRecording() : startRecording() }
+
+    func startRecording() {
+        guard !isRecording, let device = device, let tex = texture else { return }
+        let w = tex.width, h = tex.height
+        let dir = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
+                  ?? FileManager.default.homeDirectoryForCurrentUser
+        let url = dir.appendingPathComponent("MatrixRain-\(Int(CACurrentMediaTime() * 1000)).mov")
+        try? FileManager.default.removeItem(at: url)
+        guard let writer = try? AVAssetWriter(outputURL: url, fileType: .mov) else { return }
+        let settings: [String: Any] = [
+            AVVideoCodecKey: AVVideoCodecType.hevc,
+            AVVideoWidthKey: w, AVVideoHeightKey: h,
+            AVVideoCompressionPropertiesKey: [
+                AVVideoAverageBitRateKey: Int(Double(w * h) * 10.0),   // ~high bitrate, crisp green-on-black
+                AVVideoExpectedSourceFrameRateKey: max(1, Int(params.fps.rounded()))]]
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
+        input.expectsMediaDataInRealTime = true
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey as String: w, kCVPixelBufferHeightKey as String: h,
+            kCVPixelBufferMetalCompatibilityKey as String: true])
+        guard writer.canAdd(input) else { return }
+        writer.add(input)
+        if recCache == nil { CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &recCache) }
+        guard writer.startWriting() else { return }
+        writer.startSession(atSourceTime: .zero)
+        assetWriter = writer; videoInput = input; pbAdaptor = adaptor
+        recFrameIndex = 0; recURL = url; isRecording = true
+        showRecIndicator(true)
+    }
+
+    func stopRecording() {
+        guard isRecording else { return }
+        isRecording = false
+        showRecIndicator(false)
+        videoInput?.markAsFinished()
+        let url = recURL
+        assetWriter?.finishWriting {
+            DispatchQueue.main.async { if let url = url { NSWorkspace.shared.activateFileViewerSelecting([url]) } }
+        }
+        assetWriter = nil; videoInput = nil; pbAdaptor = nil; recURL = nil
+    }
+
+    /// A small "● REC" badge the user sees but which is excluded from the recording (sharingType .none
+    /// keeps it out of the captured input, so it never reaches the rendered/recorded frames).
+    private func showRecIndicator(_ show: Bool) {
+        if !show { recIndicator?.orderOut(nil); return }
+        if recIndicator == nil {
+            let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 104, height: 36),
+                            styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+            p.level = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 2)
+            p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+            p.ignoresMouseEvents = true; p.hasShadow = false; p.backgroundColor = .clear; p.sharingType = .none
+            let label = NSTextField(labelWithString: "\u{25CF} REC")
+            label.font = .systemFont(ofSize: 17, weight: .bold); label.textColor = .systemRed
+            label.alignment = .center; label.drawsBackground = true
+            label.backgroundColor = NSColor.black.withAlphaComponent(0.55)
+            label.frame = NSRect(x: 0, y: 0, width: 104, height: 36)
+            p.contentView?.addSubview(label)
+            recIndicator = p
+        }
+        if let scr = NSScreen.main?.frame { recIndicator?.setFrameOrigin(NSPoint(x: scr.maxX - 124, y: scr.maxY - 52)) }
+        recIndicator?.orderFront(nil)
+    }
 
     private static func makePipeline(device: MTLDevice, source: String) -> MTLComputePipelineState? {
         do {
@@ -560,14 +641,46 @@ class MetalView: MTKView {
             e1.endEncoding()
         }
 
-        // Pass 2: mid -> drawable
+        // When recording, render pass 2 into a video-backed texture (then blit to the drawable so the
+        // screen still shows it). Otherwise render straight to the drawable.
+        var recPB: CVPixelBuffer?
+        var recCVTex: CVMetalTexture?
+        var pass2Target = drawable.texture
+        if isRecording, let adaptor = pbAdaptor, let pool = adaptor.pixelBufferPool, let cache = recCache {
+            var pb: CVPixelBuffer?
+            if CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pb) == kCVReturnSuccess, let pb = pb {
+                var cvt: CVMetalTexture?
+                CVMetalTextureCacheCreateTextureFromImage(nil, cache, pb, nil, .bgra8Unorm,
+                                                          drawable.texture.width, drawable.texture.height, 0, &cvt)
+                if let cvt = cvt, let mt = CVMetalTextureGetTexture(cvt) { recPB = pb; recCVTex = cvt; pass2Target = mt }
+            }
+        }
+
+        // Pass 2: mid -> pass2Target
         if let e2 = commandBuffer.makeComputeCommandEncoder() {
             e2.setComputePipelineState(crtPipeline)
             e2.setTexture(midTexture, index: 0)
-            e2.setTexture(drawable.texture, index: 1)
+            e2.setTexture(pass2Target, index: 1)
             e2.setBytes(&uniforms, length: MemoryLayout<MatrixUniforms>.stride, index: 0)
             e2.dispatchThreadgroups(groups, threadsPerThreadgroup: tg)
             e2.endEncoding()
+        }
+
+        if let recPB = recPB, pass2Target !== drawable.texture {
+            if let blit = commandBuffer.makeBlitCommandEncoder() {
+                blit.copy(from: pass2Target, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                          sourceSize: MTLSize(width: drawable.texture.width, height: drawable.texture.height, depth: 1),
+                          to: drawable.texture, destinationSlice: 0, destinationLevel: 0, destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+                blit.endEncoding()
+            }
+            let idx = recFrameIndex, ts = Int32(max(1, Int(params.fps.rounded())))
+            commandBuffer.addCompletedHandler { [weak self] _ in
+                _ = recCVTex   // hold the CVMetalTexture until the GPU finishes writing the buffer
+                guard let self = self, self.isRecording, let input = self.videoInput,
+                      let adaptor = self.pbAdaptor, input.isReadyForMoreMediaData else { return }
+                adaptor.append(recPB, withPresentationTime: CMTime(value: idx, timescale: ts))
+            }
+            recFrameIndex += 1
         }
 
         commandBuffer.present(drawable)

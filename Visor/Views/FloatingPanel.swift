@@ -38,9 +38,9 @@ class FloatingPanel<Content: View>: NSPanel {
 
 class FloatingPanelManager<PanelContent: View>: ObservableObject {
     @Published var isPresented: Bool = false
-    
+
     private var panel: FloatingPanel<PanelContent>?
-    
+
     func presentPanel(content: () -> PanelContent, contentRect: CGRect) {
         if panel == nil {
             panel = FloatingPanel(view: content, contentRect: contentRect)
