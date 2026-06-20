@@ -56,19 +56,21 @@ Measured with `top` (CPU) and `ioreg` GPU utilization, relative to an idle basel
 
 ## Installation & usage
 
-1. Open `Visor.xcodeproj` in Xcode and run (the scheme is `CaptureSample`).
-2. A square icon appears in the menu bar. Click it, then:
-   - **Visor Down** — start the effect
-   - **Visor Up** — stop it
+1. Open `Visor.xcodeproj` in Xcode and run (the scheme is `CaptureSample`); it builds as **Matrix.app**.
+2. A katakana **ﾑ** icon appears in the menu bar. Click it, then:
+   - **Turn On** — start the effect
+   - **Turn Off** — stop it
    - **Matrix Settings…** — open the live tuning panel
 3. The first run prompts for **Screen Recording** permission, which is required.
-
-Depending on your macOS version and resolution, you may need to adjust **Top Spacing** in Settings to account for the menu-bar height.
 
 ## Credits
 
 - Forked from **[fchughes/Visor](https://github.com/fchughes/Visor)** (itself based on Apple's ScreenCaptureKit sample code).
 - Matrix effect, performance work, and documentation: **Claude (Anthropic)**, driven by [@bendytree](https://github.com/bendytree).
+
+## Disclaimer
+
+This is an independent, fan-made hobby project. It is **not affiliated with, endorsed by, sponsored by, or associated with** Warner Bros. Entertainment, Village Roadshow Pictures, the Wachowskis, or anyone involved with the film _The Matrix_. "The Matrix" and all related names, marks, and imagery are the property of their respective owners; they're referenced here only descriptively to convey the visual style. No copyrighted material from the film is included.
 
 ## License
 

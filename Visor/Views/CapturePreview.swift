@@ -492,14 +492,6 @@ class MetalView: MTKView {
         }
     }
 
-    /// Lets the "Select Shader" picker hot-swap the matrix (pass-1) shader.
-    func updateShader(shaderPath: String) {
-        guard let device = device,
-              let src = try? String(contentsOfFile: shaderPath, encoding: .utf8),
-              let pipeline = MetalView.makePipeline(device: device, source: src) else { return }
-        matrixPipeline = pipeline
-    }
-
     func updateTexture(with surface: IOSurface) {
         guard let device = device else { return }
         let w = IOSurfaceGetWidth(surface)

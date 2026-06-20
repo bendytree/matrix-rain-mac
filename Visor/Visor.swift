@@ -1,6 +1,5 @@
 import ScreenCaptureKit
 import SwiftUI
-import UniformTypeIdentifiers
 
 class VisorAppManager: ObservableObject {
     init() {
@@ -21,8 +20,12 @@ struct VisorApp: App {
     @StateObject private var appManager = VisorAppManager()
 
     var body: some Scene {
-        MenuBarExtra("Visor", systemImage: "squareshape.dashed.squareshape") {
+        MenuBarExtra {
             ContentView()
+        } label: {
+            // Katakana glyph for a "Matrix digital rain" look in the menu bar.
+            Text(verbatim: "ﾑ")
+                .font(.system(size: 15, weight: .bold, design: .monospaced))
         }
     }
 }
