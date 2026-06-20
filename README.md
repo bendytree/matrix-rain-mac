@@ -2,6 +2,10 @@
 
 Turn your **live macOS screen** into _Matrix_ digital rain on a vintage 80's CRT — a real-time, click-through overlay that recolors whatever's actually on screen into green phosphor, rains glyphs into the blank areas, and wraps it all in scanlines, glow, and curvature.
 
+![Matrix Rain — live demo](docs/demo.gif)
+
+_Recorded live from a real screen (2× speed). ▶ [Full-quality video](docs/demo.mp4)._
+
 > **Forked from [fchughes/Visor](https://github.com/fchughes/Visor).** Visor supplied the hard plumbing — ScreenCaptureKit → Metal → a click-through full-screen overlay, with screen-recording permission handling. This fork swaps the shader for a content-aware Matrix effect and adds live tuning plus a round of performance work.
 
 > ⚠️ **Entirely vibe-coded by Claude.** Every line of this fork — the shaders, the capture wiring, the performance optimization, and this README — was written by Claude (Anthropic) through conversation, with a human only steering and eyeballing the output. There was no manual code review of the implementation. Calibrate your trust accordingly.
