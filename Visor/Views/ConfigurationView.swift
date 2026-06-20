@@ -6,7 +6,9 @@ struct ConfigurationView: View {
     @ObservedObject var screenRecorder: ScreenRecorder
 
     var body: some View {
-        Button("Matrix Settings…") { showMatrixSettings() }
+        Text("Matrix")
+        Divider()
+        Button("Settings") { showMatrixSettings() }
         Button("Turn On") {
             Task {
                 await screenRecorder.monitorAvailableContent()
