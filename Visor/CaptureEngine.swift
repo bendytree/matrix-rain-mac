@@ -19,6 +19,7 @@ class CaptureEngine: NSObject, @unchecked Sendable {
     private let logger = Logger()
     
     private var stream: SCStream?
+    private var streamOutput: CaptureEngineStreamOutput?   // must be retained or no frames are delivered
     private let videoSampleBufferQueue = DispatchQueue(label: "com.example.apple-samplecode.VideoSampleBufferQueue")
     
     // Store the the startCapture continuation, so that you can cancel it when you call stopCapture().
@@ -27,16 +28,21 @@ class CaptureEngine: NSObject, @unchecked Sendable {
     /// - Tag: StartCapture
     func startCapture(configuration: SCStreamConfiguration, filter: SCContentFilter) -> AsyncThrowingStream<CapturedFrame, Error> {
         AsyncThrowingStream<CapturedFrame, Error> { continuation in
-            // The stream output object.
-            let streamOutput = CaptureEngineStreamOutput(continuation: continuation)
-            streamOutput.capturedFrameHandler = { continuation.yield($0) }
-            
+            // The stream output object. Retain it on the engine — addStreamOutput does not
+            // keep a strong reference, and the delegate reference is weak.
+            let output = CaptureEngineStreamOutput(continuation: continuation)
+            self.streamOutput = output
+            output.capturedFrameHandler = { continuation.yield($0) }
+
             do {
-                stream = SCStream(filter: filter, configuration: configuration, delegate: streamOutput)
-                
+                stream = SCStream(filter: filter, configuration: configuration, delegate: output)
+
                 // Add a stream output to capture screen content.
-                try stream?.addStreamOutput(streamOutput, type: .screen, sampleHandlerQueue: videoSampleBufferQueue)
-                stream?.startCapture()
+                try stream?.addStreamOutput(output, type: .screen, sampleHandlerQueue: videoSampleBufferQueue)
+                // Use the completion-handler form so start-up errors surface instead of being swallowed.
+                stream?.startCapture { error in
+                    if let error = error { continuation.finish(throwing: error) }
+                }
             } catch {
                 continuation.finish(throwing: error)
             }
@@ -78,7 +84,7 @@ private class CaptureEngineStreamOutput: NSObject, SCStreamOutput, SCStreamDeleg
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of outputType: SCStreamOutputType) {
         // Return early if the sample buffer is invalid.
         guard sampleBuffer.isValid else { return }
-        
+
         switch outputType {
         case .screen:
             // Create a CapturedFrame structure for a video sample buffer.

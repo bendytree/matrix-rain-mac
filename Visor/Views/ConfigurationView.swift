@@ -15,11 +15,13 @@ struct ConfigurationView: View {
             .disabled(screenRecorder.isRunning)
         Button("Select Shader") { selectShader() }
             .disabled(screenRecorder.isRunning)
+        Button("Matrix Settings…") { showMatrixSettings() }
         Button("Visor Down") {
             Task {
                 await screenRecorder.monitorAvailableContent()
                 guard let display = screenRecorder.selectedDisplay else { return }
-                screenRecorder.panelManager.presentPanel(content: { screenRecorder.capturePreview }, contentRect: CGRect(x: 0, y: screenRecorder.topSpace, width: display.width, height: display.height - screenRecorder.topSpace))
+                let frame = NSScreen.main?.frame ?? CGRect(x: 0, y: 0, width: display.width, height: display.height)
+                screenRecorder.panelManager.presentPanel(content: { screenRecorder.capturePreview }, contentRect: frame)
                 await screenRecorder.start()
             }
         }
@@ -59,6 +61,20 @@ struct ConfigurationView: View {
         }
     }
 
+    func showMatrixSettings() {
+        let view = MatrixSettingsView(params: screenRecorder.capturePreview.metalView.params)
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 340, height: 590),
+            styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.title = "Matrix Settings"
+        window.level = .popUpMenu             // above the full-screen overlay
+        window.isReleasedWhenClosed = false
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        window.contentView = NSHostingView(rootView: view)
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+    }
+
     func showSettings() {
         let settingsView = SettingsView(inputNumber: $screenRecorder.topSpace)
 
@@ -73,6 +89,47 @@ struct ConfigurationView: View {
         window.contentView = NSHostingView(rootView: settingsView)
         window.center()
         window.makeKeyAndOrderFront(nil)
+    }
+}
+
+struct MatrixSettingsView: View {
+    @ObservedObject var params: MatrixParams
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Toggle("Show rain mask (pink)", isOn: $params.maskDebug)
+            Toggle("Rain enabled", isOn: $params.rainOn)
+            Divider()
+            row("Flat threshold", $params.flatThreshold, 0.005...0.2)
+            row("Mask detail (px)", $params.maskCell, 6...80)
+            row("Rain glyph size", $params.cellSize, 10...110)
+            Divider()
+            row("Rain opacity", $params.rainOpacity, 0...1)
+            row("Rain density", $params.rainDensity, 0...12)
+            row("Trail length", $params.trailLength, 4...100)
+            row("Cursor clear", $params.cursorClear, 0...700)
+            row("Rain speed", $params.rainSpeed, 0.05...2)
+            row("Glyph churn", $params.glyphChurn, 0...30)
+            Divider()
+            row("Scanlines", $params.scanlineStrength, 0...0.5)
+            row("Glow", $params.glow, 0...1.5)
+            row("Curvature", $params.curvature, 0...0.25)
+            row("Contrast", $params.contrast, 0.5...2.5)
+            row("Roll bar", $params.barSpeed, 0...1)
+        }
+        .padding()
+        .frame(width: 340)
+    }
+
+    private func row(_ label: String, _ value: Binding<Float>, _ range: ClosedRange<Float>) -> some View {
+        HStack {
+            Text(label).frame(width: 105, alignment: .leading)
+            Slider(value: value, in: range)
+            Text(String(format: "%.3f", value.wrappedValue))
+                .frame(width: 48, alignment: .trailing)
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+        }
     }
 }
 

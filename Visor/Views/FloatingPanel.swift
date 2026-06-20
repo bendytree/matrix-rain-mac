@@ -14,10 +14,15 @@ class FloatingPanel<Content: View>: NSPanel {
                    defer: flag)
 
         isFloatingPanel = true
-        level = .floating
+        // Sit just above the menu bar so the whole screen (incl. the menu bar) is covered.
+        level = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 1)
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
         ignoresMouseEvents = true
         animationBehavior = .utilityWindow
         backgroundColor = .clear
+        // Hide the overlay from screen capture so the shader never captures its own
+        // output (which would create a runaway feedback "wormhole").
+        sharingType = .none
         
         /// Set the content view.
         /// The safe area is ignored because the title bar still interferes with the geometry
@@ -39,8 +44,8 @@ class FloatingPanelManager<PanelContent: View>: ObservableObject {
     func presentPanel(content: () -> PanelContent, contentRect: CGRect) {
         if panel == nil {
             panel = FloatingPanel(view: content, contentRect: contentRect)
-            panel?.center()
         }
+        panel?.setFrame(contentRect, display: true)
         panel?.setIsVisible(true)
         isPresented = true
     }

@@ -13,7 +13,7 @@ import SwiftUI
 
 @MainActor
 class ScreenRecorder: ObservableObject {
-    @Published var topSpace = 40
+    @Published var topSpace = 0
 
     /// The supported capture types.
     enum CaptureType {
@@ -111,7 +111,7 @@ class ScreenRecorder: ObservableObject {
             // Start the stream and await new video frames.
             for try await frame in captureEngine.startCapture(configuration: config, filter: filter) {
                 capturePreview.updateFrame(frame)
-                
+
                 if contentSize != frame.size {
                     // Update the content size if it changed.
                     contentSize = frame.size
